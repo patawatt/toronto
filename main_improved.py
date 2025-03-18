@@ -1,90 +1,172 @@
 import glob
 import pandas as pd
-import sqlite3
+import numpy as np
+# import scipy as sp
 
-# Read textfile from Toronto Airport weather station and slice out columns for date, and sunrise, sunset times
-suntime = pd.read_fwf('daylight/sun.txt', skiprows=16, widths=[6, 16, 5, 7, 7])
-suntime = suntime.iloc[:-1, [0, 2, 4]]
-suntime.columns = ['date', 'sunrise', 'sunset']
+def make_df(filename):
+    """
+    This function takes a file name, creates a DataFrame for the temperature data in that frame,
+    and rounds the timestamp to the nearest hour.
+    """
 
-# change format of times to python date-time format, set as dataframe index
-suntime['date'] = pd.to_datetime(suntime['date'] + ', 2018').dt.date
-suntime.set_index(pd.DatetimeIndex(suntime['date']), inplace=True)
-suntime.sunrise = suntime.index + pd.to_timedelta(suntime.sunrise + ':00', unit='h')
-suntime.sunset = suntime.index + pd.to_timedelta(suntime.sunset + ':00', unit='h')
-# drop redundant date column
-suntime = suntime.drop(['date'], axis=1)
-suntime.sort_index(inplace=True)
-final = suntime.copy()
+    # read file to DataFrame, rename value column to match address of data-logger
+    df = pd.read_csv(filename, skiprows=14)
+    df = df.rename(columns={'Date/Time': 'dt', 'Value': filename[5:-12]})
 
-# iterate through list of datalogger .csv files in data directory
-files = glob.glob('data/*.csv')
+    # Round to nearest hour (all measurements taken at 1 or 2 minutes past the every even hour).
+    df.dt = pd.DatetimeIndex(df['dt'])
+    df['dt'] = df['dt'].dt.round('H')
+    df.set_index(df['dt'], inplace=True)
 
-for j in range(len(files)):
-    df = pd.read_csv(files[j], skiprows=14)
-
-    # add temperature data for each address as new column to df
-    df = df.rename(columns={'Date/Time': 'dt', 'Value': files[j][5:-12]})
-    df.set_index(pd.DatetimeIndex(df['dt']), inplace=True)
     # keep only data in 2018
     df = df.loc[df.index.year == 2018, :]
-    df.dt = pd.DatetimeIndex(df['dt'])
     df.sort_index()
 
-    # create lists of sunrise and sunset timestamps
-    sunrises = []
-    sunsets = []
-    for i in range(len(df)):
-        sunrises.append(suntime.loc[str(df.iloc[i, 0].date())]['sunrise'])
-        sunsets.append(suntime.loc[str(df.iloc[i, 0].date())]['sunset'])
+    return df
 
-    # add sunset and sunrise lists as columns to df with single address
-    df['sunrise'] = sunrises
-    df['sunset'] = sunsets
-    # create new column that describes which times are day and not using true/false
-    df['day'] = (df['sunrise'] <= df['dt']) & (df['dt'] < df['sunset'])
+def degday(mean_temp, threshold):
+    """
+    Calculates the growing degree day above a certain threshold for individual days.
+    """
+    if pd.notnull(mean_temp):
+        return max(0.0, (mean_temp - threshold))
+    else:
+        return None
 
-    # create individual dataframes for measurements during day and night
-    day = df[df['day']].drop(['day'], axis=1)
-    night = df[~df['day']].drop(['day'], axis=1)
 
-    # take daily means of day temperature and night temperature by resampling
-    d_d_av = day.resample('D').mean()
-    n_d_av = night.resample('D').mean()
+# create list of datalogger .csv files in data directory
+files = glob.glob('data/*.csv')
 
-    # merge the day and night dataframes together so daily averages can be compared side by side
-    frames = [d_d_av, n_d_av]
-    merge = pd.merge(frames[0], frames[1], how='inner', left_index=True,
-                     right_index=True, suffixes=('_d', '_n'))
-    merge2 = pd.merge(final, merge, how='inner', left_index=True,
-                      right_index=True)
+# make first DataFrame from first site
+df1 = make_df(files[0])
 
-    final = merge2
+# iterate through files, make data frame for each address
+for j in range(1, len(files)):
+    df2 = make_df(files[j])
 
-# remove sunset and sunrise times as no longer needed.
-final = final.drop(['sunrise', 'sunset'], axis=1)
+    # merge the new DataFrames to the original data frame
+    df1 = pd.merge(df1, df2.iloc[:, 2], how='outer', left_index=True, right_index=True)
 
-# SAVE TO EXCEL
-final.to_excel("day_night_temp_daily_AV.xlsx")
+sites = [x[5:-12] for x in files]
 
-# resample at weekly intervals
-wfinal = final.resample('W').mean()
-wfinal.to_excel("day_night_temp_weekly_AV.xlsx")
+# make date and dt columns.  date column is needed for df.groupby function to calculate daily mean temps.
+df1['date'] = df1['dt'].dt.date
+df1['time']= df1['dt'].dt.time
+df1 = df1.drop(['dt', 'Unit'], axis=1)
 
-# resample at monthly intervals
-mfinal = final.resample('M').mean()
-mfinal.to_excel("day_night_temp_monthly_AV.xlsx")
+# get mean temperature for each day (calculated from all 12 measurements).
+mean_temps = df1.groupby(['date']).mean()
 
-# export to sql database
-conn = sqlite3.connect('daily_temperature_averages.db')
-c = conn.cursor()
-c.execute('CREATE TABLE TEMPS(date, temp)')
-conn.commit()
-final.to_sql('TEMPS', conn, if_exists= 'replace', index=False)
+# vectorize degreeday function so that it works on arrays and not just single values
+vdegday = np.vectorize(degday)
 
-c.execute('''
-SELECT * FROM TEMPS
-''')
+# list of threshold temperatures, starting at 0 increasing to 10 degrees C by intervals of 0.5 (21 temps total).
+threshold_temps = np.linspace(0.0, 10.0, 21.0)
 
-for row in c.fetchall():
-    print(row)
+# create a list of 21 arrays, calculating daily heat units (HU) (non-cumulative), using 21 different threshold temps.
+dailyHUs = {}
+for threshold in threshold_temps:
+    # use vectorized degree day function to get array of daily heat units.
+    dailyHUs[threshold] = vdegday(mean_temps, threshold)
+
+# create lists for different start days, Jan 1, March 9, 19, 29, April 8, 18
+start_days = [0, 67, 77, 87, 97, 107, 117]
+
+ff = pd.read_csv('data/flower/Redbud_flowering_data_forPatrick.csv')
+ff = ff.loc[:, ['Address','GDD_FF']]
+
+first_flower = dict.fromkeys(sites)
+for key in first_flower:
+    cell = ff.loc[ff['Address'] == key]['GDD_FF'].item()
+    if pd.notnull(cell):
+        first_flower[key] = int(cell)
+    else:
+        first_flower[key] = None
+
+
+latest_flower = max(first_flower.values())
+
+thresholds = {}
+for key, array in dailyHUs.items():
+    curr = pd.DataFrame(array)
+
+    # create multiple DataFrames with different start points, but same threshold temp, accumulate temperature data
+    start_points = {}
+    for start in start_days:
+        start_points[start] = curr.iloc[start:latest_flower].cumsum()
+
+    # add list of DataFrames with same threshold temperature to list of threshold temperatures
+    thresholds[key] = start_points
+
+# convert day of year integer to yyyy-mm-dd format
+dts = pd.Series((np.asarray(2018, dtype='datetime64[Y]')-1970)
+                +(np.asarray(start_days, dtype='timedelta64[D]'))).dt.strftime('%b%-d')
+# note lower case b for month abbrieviation, B for full month name.
+
+headers = []
+for temp in threshold_temps:
+    for day in dts:
+        headers.append(str(day) + "_" + str(temp) + "C")
+
+rows = {}
+for i in range(len(sites)):
+
+    curr_ff = first_flower[sites[i]]-1
+    rows[sites[i]] = []
+
+    for j in range(len(threshold_temps)):
+
+        for k in range(len(start_days)):
+            rows[sites[i]].append(thresholds[threshold_temps[j]][start_days[k]].loc[curr_ff, i])
+
+
+ddff = pd.DataFrame.from_dict(rows, orient='index', columns=headers)
+# ddff.to_excel("gdd_ff_7startdays.xlsx")
+# subset = ddff[['Jan1_0.0C', 'Mar9_0.0C', 'Apr28_0.0C', 'ff']]
+# subset.to_excel("gdd_dec7.xlsx")
+
+remove = pd.read_csv('data/flower/remove.csv')
+ddff.drop(remove['Address'].values.tolist(), inplace=True)
+
+df_ff = pd.DataFrame.from_dict(first_flower, orient='index', columns=['ff'])
+ddff['ff'] = df_ff['ff']
+corr_matrix = ddff.corr()
+
+final_corr = corr_matrix['ff']
+
+#family = binomial
+#link = logit
+
+from sklearn.linear_model import LogisticRegression
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+xs = ddff['Jan1_0.0C'].to_list()
+xs.sort()
+ys = list(np.arange(1, len(xs)+1)/float(len(xs)))
+fig1, ax1 = plt.subplots()
+ax1.plot(xs, ys)
+# logit = sm.Logit(ys, xs).fit()
+
+pred_input = np.linspace(min(xs), max(xs),10)
+# predictions = logit.predict(pred_input)
+# ax1.plot(pred_input, predictions)
+
+binom = sm.GLM(ys, xs, family=sm.families.Binomial())
+
+print(binom_results.summary)
+print(binom_results.params)
+print(binom_results.pvalues)
+print(binom_results.model.endog_names)
+predictions = binom_results.predict()
+
+# instantiate the model (using the default parameters)
+# logreg = LogisticRegression()
+#
+#
+# # fit the model with data
+# logreg.fit(xs, ys)
+
+# relative log likelihoods, aic
+# glm_binom = sm.GLM(xs, ys,family=sm.families.Binomial())
+# res = glm_binom.fit()
+# print(res.summary())
